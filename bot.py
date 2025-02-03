@@ -34,6 +34,7 @@ CONFIG = {
     "telegram_token": os.getenv("TELEGRAM_TOKEN"),
     "gemini_api_key": os.getenv("GEMINI_API_KEY"),
     "max_history_length": int(os.getenv("MAX_HISTORY_LENGTH", 5)),
+    "max_games_per_user": int(os.getenv("MAX_GAMES_PER_USER", 3)),  # Максимальное количество сохраненных игр
     "db_path": "story_bot.db"
 }
 
@@ -48,135 +49,240 @@ class Database:
         self.db_path = CONFIG["db_path"]
 
     async def init_db(self):
-        async with aiosqlite.connect(self.db_path) as conn:
-            # Create the table if it doesn't exist
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    context TEXT,
-                    history TEXT,
-                    saw_welcome BOOLEAN DEFAULT 0
-                )
-            ''')
+        max_retries = 3
+        retry_delay = 1  # seconds
 
-            # Check if saw_welcome column exists
-            cursor = await conn.execute("PRAGMA table_info(users)")
-            columns = await cursor.fetchall()
-            column_names = [column[1] for column in columns]
+        for attempt in range(max_retries):
+            try:
+                # Try to remove the database file if it exists and is locked
+                if attempt > 0 and os.path.exists(self.db_path):
+                    try:
+                        os.remove(self.db_path)
+                        logger.info("Removed locked database file")
+                    except Exception as e:
+                        logger.warning(f"Could not remove database file: {e}")
 
-            # Add saw_welcome column if it doesn't exist
-            if 'saw_welcome' not in column_names:
-                await conn.execute('ALTER TABLE users ADD COLUMN saw_welcome BOOLEAN DEFAULT 0')
+                async with aiosqlite.connect(self.db_path, timeout=20) as conn:
+                    # Enable foreign keys and configure SQLite
+                    await conn.execute("PRAGMA foreign_keys = ON")
+                    await conn.execute("PRAGMA journal_mode = WAL")
+                    await conn.execute("PRAGMA busy_timeout = 5000")  # 5 second timeout
 
-            await conn.commit()
-    async def get_user_context(self, user_id: int) -> Dict:
+                    # Drop existing tables if they exist
+                    await conn.execute("DROP TABLE IF EXISTS users")
+                    await conn.execute("DROP TABLE IF EXISTS game_sessions")
+
+                    # First create game_sessions table
+                    await conn.execute('''
+                        CREATE TABLE game_sessions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL,
+                            context TEXT DEFAULT '',
+                            history TEXT DEFAULT '',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+
+                    # Then create users table with foreign key reference
+                    await conn.execute('''
+                        CREATE TABLE users (
+                            user_id INTEGER PRIMARY KEY,
+                            current_game_id INTEGER,
+                            saw_welcome BOOLEAN DEFAULT 0,
+                            FOREIGN KEY (current_game_id) 
+                            REFERENCES game_sessions (id)
+                            ON DELETE SET NULL
+                        )
+                    ''')
+
+                    await conn.commit()
+                    logger.info("Database tables recreated successfully")
+                    return  # Success, exit the function
+
+            except Exception as e:
+                logger.error(f"Database initialization error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    raise  # Re-raise the last exception if all retries failed
+    async def cleanup_old_games(self, user_id: int):
+        """Delete old game sessions, keeping only the most recent ones"""
         try:
             async with aiosqlite.connect(self.db_path) as conn:
+                # Get all game sessions for user, ordered by creation time
+                cursor = await conn.execute('''
+                    SELECT id FROM game_sessions 
+                    WHERE user_id = ? 
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?
+                ''', (user_id, CONFIG["max_games_per_user"]))
+
+                old_games = await cursor.fetchall()
+                if old_games:
+                    # Delete old games
+                    old_game_ids = [game[0] for game in old_games]
+                    await conn.execute(
+                        'DELETE FROM game_sessions WHERE id IN ({})'.format(
+                            ','.join('?' * len(old_game_ids))
+                        ),
+                        old_game_ids
+                    )
+                    await conn.commit()
+                    logger.info(f"Cleaned up {len(old_game_ids)} old games for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error cleaning up old games: {e}")
+            raise
+    async def create_new_game(self, user_id: int) -> int:
+        """Create a new game session and return its ID"""
+        try:
+            # First, cleanup old games
+            await self.cleanup_old_games(user_id)
+
+            async with aiosqlite.connect(self.db_path) as conn:
+                # Insert new game session
                 cursor = await conn.execute(
-                    'SELECT context, history, saw_welcome FROM users WHERE user_id = ?',
-                    (user_id,)
+                    'INSERT INTO game_sessions (user_id, context, history) VALUES (?, ?, ?)',
+                    (user_id, '', '')
                 )
+                game_id = cursor.lastrowid
+
+                # Update user's current game
+                await conn.execute(
+                    'INSERT OR REPLACE INTO users (user_id, current_game_id) VALUES (?, ?)',
+                    (user_id, game_id)
+                )
+                await conn.commit()
+                return game_id
+        except Exception as e:
+            logger.error(f"Error creating new game: {e}")
+            return None
+    async def get_user_context(self, user_id: int) -> Dict:
+        """Get current game context for user"""
+        try:
+            async with aiosqlite.connect(self.db_path) as conn:
+                # Get current game session
+                cursor = await conn.execute('''
+                    SELECT g.context, g.history, u.saw_welcome 
+                    FROM users u 
+                    LEFT JOIN game_sessions g ON u.current_game_id = g.id 
+                    WHERE u.user_id = ?
+                ''', (user_id,))
                 result = await cursor.fetchone()
+
                 return {
-                    "context": result[0] if result else "",
+                    "context": result[0] if result and result[0] else "",
                     "history": result[1].split('|') if result and result[1] else [],
                     "saw_welcome": bool(result[2]) if result else False
-                } if result else {"context": "", "history": [], "saw_welcome": False}
+                }
         except Exception as e:
             logger.error(f"Database error in get_user_context: {e}")
             return {"context": "", "history": [], "saw_welcome": False}
+
     async def update_user_context(self, user_id: int, context: str, history: List[str], saw_welcome: bool = None):
+        """Update current game context"""
         try:
             async with aiosqlite.connect(self.db_path) as conn:
                 history_str = '|'.join(history[-CONFIG["max_history_length"]:])
+
+                # Update game session
+                await conn.execute('''
+                    UPDATE game_sessions 
+                    SET context = ?, history = ? 
+                    WHERE id = (SELECT current_game_id FROM users WHERE user_id = ?)
+                ''', (context, history_str, user_id))
+
                 if saw_welcome is not None:
                     await conn.execute(
-                        '''INSERT OR REPLACE INTO users (user_id, context, history, saw_welcome)
-                           VALUES (?, ?, ?, ?)''',
-                        (user_id, context, history_str, saw_welcome)
+                        'UPDATE users SET saw_welcome = ? WHERE user_id = ?',
+                        (saw_welcome, user_id)
                     )
-                else:
-                    await conn.execute(
-                        '''INSERT OR REPLACE INTO users (user_id, context, history)
-                           VALUES (?, ?, ?)''',
-                        (user_id, context, history_str)
-                    )
+
                 await conn.commit()
         except Exception as e:
             logger.error(f"Database error in update_user_context: {e}")
-            # В случае ошибки пытаемся восстановить предыдущий контекст
             try:
                 old_context = await self.get_user_context(user_id)
                 logger.info(f"Restored previous context for user {user_id}")
             except Exception as restore_error:
                 logger.error(f"Failed to restore context: {restore_error}")
+
 # Инициализация базы данных
 async def init_database():
     db = Database()
     await db.init_db()
     return db
 
-
-# Генерация контента через Gemini
+# Классы для работы с контентом
 class StoryParser:
     @staticmethod
     def parse_response(text: str) -> tuple:
         try:
-            # Split by sections
-            sections = text.split("[ВАРИАНТЫ]")
-            if len(sections) != 2:
-                sections = text.split("[ОПИСАНИЕ]")
-                if len(sections) > 1:
-                    description = sections[1]
-                    options_text = sections[-1]
-                else:
-                    raise ValueError("Could not find sections")
-            else:
-                description = sections[0].replace("[ОПИСАНИЕ]", "").strip()
-                options_text = sections[1].strip()
+            # Normalize line endings and clean up text
+            text = text.replace('\r\n', '\n').strip()
 
-            # Clean up description
-            description = description.strip()
-
-            # Extract options using more robust pattern matching
+            # First try to find sections using markers
+            description = ""
             options = []
-            lines = options_text.split('\n')
-            for line in lines:
-                # Remove markdown formatting and special characters
-                line = re.sub(r'[*_~`]', '', line)  # Remove markdown formatting
-                line = re.sub(r'^\d+\.?\s*', '', line.strip())  # Remove numbering
-                line = re.sub(r'^\s*[•\-★]\s*', '', line)  # Remove bullet points
 
-                # Split by pipe if present
-                if '|' in line:
-                    parts = [p.strip() for p in line.split('|')]
-                    options.extend(p for p in parts if p and not p.isspace())
-                # Add non-empty lines
-                elif line and not line.isspace():
-                    options.append(line)
+            # Find description section
+            desc_start = text.find("[ОПИСАНИЕ]")
+            if desc_start != -1:
+                desc_end = text.find("[ВАРИАНТЫ]", desc_start)
+                if desc_end == -1:
+                    desc_end = len(text)
+                description = text[desc_start + len("[ОПИСАНИЕ]"):desc_end].strip()
+
+            # Find options section
+            opt_start = text.find("[ВАРИАНТЫ]")
+            if opt_start != -1:
+                options_text = text[opt_start + len("[ВАРИАНТЫ]"):].strip()
+
+                # Split options by newlines and numbers
+                lines = options_text.split('\n')
+                for line in lines:
+                    # Clean up the line
+                    line = re.sub(r'[*_~`]', '', line.strip())
+                    line = re.sub(r'^\d+\.?\s*', '', line)
+                    line = re.sub(r'^\s*[•\-★]\s*', '', line)
+
+                    # Split by pipe if present
+                    if '|' in line:
+                        parts = [p.strip() for p in line.split('|')]
+                        options.extend(p for p in parts if p and not p.isspace())
+                    elif line and not line.isspace():
+                        options.append(line)
+
+            # If no sections found, try to split by empty lines
+            if not description and not options:
+                parts = [p.strip() for p in text.split('\n\n') if p.strip()]
+                if len(parts) >= 2:
+                    description = parts[0]
+                    options = [p for p in parts[1:] if p and not p.isspace()][:3]
 
             # Clean up and format options
             # Clean up and format options
             cleaned_options = []
-            for opt in options[:3]:  # Limit to 3 options
+            for opt in options[:3]:
                 try:
-                    # Clean up the option text
-                    opt = re.sub(r'[*_~`]', '', opt.strip())  # Remove markdown
-                    opt = re.sub(r'^\d+\.?\s*', '', opt)  # Remove numbers
                     opt = opt.strip()
-                    # Add emoji and limit length if option is valid
-                    if opt and not opt.isspace() and len(opt) <= 25:
-                        cleaned_options.append(f"🔸 {opt}")
-                    elif opt and not opt.isspace():
-                        cleaned_options.append(f"🔸 {opt[:25]}")
+                    # Учитываем, что "⚡ " добавляет 3 символа
+                    if len(opt) > 31:
+                        opt = opt[:31]  # 31 + 3 (эмодзи) = 34 символа
+                    if opt and not opt.isspace():
+                        cleaned_options.append(f"⚡ {opt}")
                 except Exception as e:
                     logger.error(f"Error processing option: {e}")
-
-            # If we don't have enough valid options, add some defaults
+            # Add default options if needed
             default_options = ["Продолжить разведку", "Поискать припасы", "Найти укрытие"]
             while len(cleaned_options) < 3:
-                cleaned_options.append(f"🔸 {default_options[len(cleaned_options) - 1]}")
+                cleaned_options.append(f"⚡ {default_options[len(cleaned_options) - 1]}")
+
+            # If no valid description found, use default
+            if not description:
+                description = "Вы оказались в неизвестной ситуации. Нужно принять решение."
+
             return description, cleaned_options
+
         except Exception as e:
             logger.error(f"Error parsing response: {str(e)}")
             return "Произошла ошибка при обработке ответа.", ["🔄 Начать заново"]
@@ -185,192 +291,220 @@ class StoryGenerator:
     # Class-level model instance
     model = genai.GenerativeModel('gemini-pro')
 
-    # Forbidden content patterns (строго запрещено)
+    # Base prompt template
+    STORY_PROMPT_TEMPLATE = """[ИНСТРУКЦИЯ ДЛЯ СЦЕНАРИСТА ИГРЫ]
+Вы - опытный сценарист интерактивного квеста в жанре survival-horror (рейтинг 16+).
+Ваша задача - создавать последовательные, атмосферные эпизоды истории выживания.
+
+||| СТРУКТУРА ПОВЕСТВОВАНИЯ |||
+1. **Преемственность сюжета**:
+   • Каждый эпизод должен логически следовать из предыдущих событий
+   • Учитывать предыдущие выборы игрока
+   • Поддерживать общую линию выживания в городе
+
+2. **Атмосфера и окружение**:
+   • Время суток и погода влияют на происходящее
+   • Локации связаны между собой (улицы, здания, подвалы)
+   • Встречи с другими выжившими или следы их присутствия
+   • Звуки и запахи создают объемную картину
+
+3. **Ключевые элементы сцены**:
+   • Динамическое окружение (движение, изменения)
+   • Визуальные детали (предметы, следы, знаки)
+   • Звуковой фон (ambient, тревожные звуки)
+   • Эмоциональное состояние персонажа
+   • Намеки на возможные пути развития
+
+4. **Структура описания** (4-6 предложений):
+   • Вступление: общая картина локации
+   • Детали: особенности окружения
+   • Действие: что происходит сейчас
+   • Ощущения: реакция персонажа
+   • Подсказка: важный элемент для выбора
+
+5. **Варианты действий**:
+   • СТРОГО 3 варианта, до 30 символов каждый
+   • Каждый вариант должен:
+     - Быть логичным продолжением ситуации
+     - Вести к разным последствиям
+     - Использовать формат: [Глагол] + [Объект/Направление]
+
+||| ВАЖНЫЕ ЭЛЕМЕНТЫ |||
+• Постоянные угрозы:
+  - Зараженные (хрипы, движения, следы)
+  - Опасное окружение (темнота, завалы, пожары)
+  - Нехватка ресурсов (еда, вода, медикаменты)
+
+• Ключевые темы:
+  - Выживание и поиск безопасности
+  - Поиск информации о происходящем
+  - Помощь другим выжившим
+  - Сбор необходимых ресурсов
+
+||| ЗАПРЕТЫ |||
+× Нарушение преемственности сюжета
+× Явные описания ранений и смертей
+× Анатомические подробности
+× Сцены насилия
+× Неоправданная жестокость
+
+||| ФОРМАТ ОТВЕТА |||
+[ОПИСАНИЕ]
+<Описание текущей ситуации>
+
+[ВАРИАНТЫ]
+1. <Вариант1>
+2. <Вариант2>
+3. <Вариант3>"""
+
+    # Generation config
+    generation_config = {
+        "temperature": 0.85,  # Increased for more creative but still controlled responses
+        "top_p": 0.9,        # Slightly increased for more narrative variety
+        "top_k": 40,
+        "max_output_tokens": 1024,
+        "candidate_count": 1  # Generate single, focused response
+    }
+
+    # Content patterns
     forbidden_patterns = [
         r'\b(убийств[оа]|труп[ыа]|расчленени[ея])\b',
         r'\b(пытк[иа]|издевательств[оа])\b',
-        r'\b(суицид|самоубийств[оа])\b'
+        r'\b(суицид|самоубийств[оа])\b',
+        r'\b(кровь|кости|плоть)\b',
+        r'\b(топор|нож|пистолет)\b',
+        r'\b(умер|погиб|сдох)\b',
+        r'\b(рана|перелом|травма)\b'
     ]
 
-    # Allowed content patterns (допустимый уровень)
     allowed_patterns = [
-        r'\b(отбился|защитился|спрятался)\b',
-        r'\b(ранение|царапина|ушиб)\b',
-        r'\b(опасность|угроза|риск)\b'
+        r'\b(спрятался|укрылся|затаился)\b',
+        r'\b(царапина|ушиб|ссадина)\b',
+        r'\b(опасность|угроза|риск)\b',
+        r'\b(шорох|скрип|хрип)\b',
+        r'\b(тень|силуэт|фигура)\b',
+        r'\b(шаги|дыхание|стук)\b'
     ]
 
-    # Configure safety settings
+    # Safety settings
     safety_settings = [
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+        {
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        },
+        {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        },
+        {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        },
+        {
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        }
     ]
 
-    # Configure generation parameters
-    generation_config = {
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 40,
-        "max_output_tokens": 1024,
-    }
     @staticmethod
     async def generate_story(db: Database, user_id: int, choice: str = "") -> dict:
-        user_data = await db.get_user_context(user_id)
-
-        history_text = ' -> '.join(user_data['history']) if user_data['history'] else ""
-        current_context = user_data['context'] if user_data['context'] else 'Начало истории: Ты просыпаешься от странных звуков за окном. Телефон и интернет не работают, а на улицах слышны сирены и крики. В новостях говорили о какой-то эпидемии.'
-        choice_text = f"ВЫБОР ИГРОКА: {choice}" if choice else ""
-
-        prompt = f"""
-        [ВНИМАНИЕ: Это текст для компьютерной игры с рейтингом 12+]
-        
-        Ты — создатель интерактивных квестов в жанре зомби-выживания. Продолжи историю выживания в городе во время зомби-апокалипсиса.
-
-        **Основной сюжет:**
-        Город охвачен эпидемией, превращающей людей в зомби. Игрок должен выжить, избегая прямых столкновений, 
-        находя припасы и помогая другим выжившим. Акцент на скрытности и умном использовании ресурсов.
-        
-        **Допустимый уровень контента:**
-        - Зомби присутствуют, но описываются нейтрально ("медленно движущиеся фигуры", "странные люди")
-        - Можно убегать, прятаться, отвлекать внимание
-        - Легкая самооборона (оттолкнуть, увернуться)
-        - Поиск припасов и безопасных мест
-        
-        **Запрещено:**
-        - Кровь и расчленёнка
-        - Убийства (даже зомби)
-        - Тяжёлые травмы
-        
-        **Стиль повествования:**
-        1. Описание: 2-3 коротких предложения (максимум 150 символов)
-        2. Варианты действий: 
-           - Точно 3 варианта по 20-25 символов
-           - Начинать с глагола
-           - Реалистичные решения
-           - Акцент на выживании и помощи
-        
-        **Текущий контекст:**
-        {current_context}
-        
-        **История действий:**
-        {history_text}
-        
-        **Последний выбор:**
-        {choice_text}
-        
-        **Формат ответа:**
-        [ОПИСАНИЕ]
-        Краткое описание текущей ситуации (2-3 предложения)
-        
-        [ВАРИАНТЫ]
-        1. Действие1 | 2. Действие2 | 3. Действие3
-        
-        Помни: 
-        - Каждое действие должно быть логически связано с предыдущим выбором
-        - Избегай жестокости, делай акцент на хитрости и находчивости
-        - Поддерживай атмосферу напряжения, но без излишнего страха"""
-
+        """Generate a story response based on user context and choice"""
         try:
-            # Generate response using class-level model with safety settings
-            response = await asyncio.to_thread(
-                StoryGenerator.model.generate_content,
-                prompt,
-                generation_config=StoryGenerator.generation_config,
-                safety_settings=StoryGenerator.safety_settings
-            )
+            user_data = await db.get_user_context(user_id)
 
-            if not response or not response.text:
-                raise Exception("Empty response received")
+            # Format history with arrow separators for better readability
+            history_text = ' ➜ '.join(user_data['history']) if user_data['history'] else ""
 
-            # Check for forbidden content
-            response_text = response.text.lower()
-            for pattern in StoryGenerator.forbidden_patterns:
-                if re.search(pattern, response_text):
-                    logger.warning(f"Found forbidden content matching pattern: {pattern}")
-                    return {
-                        "text": "⚠️ Контент не соответствует требованиям. Генерирую новый вариант...",
-                        "options": ["🔄 Начать заново"]
-                    }
+            # Default starting context if none exists
+            current_context = user_data['context'] if user_data['context'] else '''
+Начало истории: Сумерки. Ты просыпаешься от странных звуков за окном. 
+Телефон и интернет не работают, а на улицах слышны сирены и крики. 
+В последних новостях говорили о какой-то эпидемии и призывали сохранять спокойствие.
+Нужно разобраться в происходящем и найти безопасное место.'''
 
-            logger.info("Successfully generated response using Gemini")
+            # Format player's choice with timestamp
+            choice_text = f"ВЫБОР ИГРОКА ({len(user_data['history']) + 1}): {choice}" if choice else ""
 
-            # Parse the response
-            story_text, options = StoryParser.parse_response(response.text)
+            # Combine template with dynamic content and additional context
+            prompt = f"""{StoryGenerator.STORY_PROMPT_TEMPLATE}
 
-            # Update user context
-            new_history = user_data['history'] + [choice] if choice else user_data['history']
-            await db.update_user_context(user_id, story_text, new_history)
+||| ТЕКУЩИЙ КОНТЕКСТ |||
+{current_context}
 
-            return {
-                "text": story_text,
-                "options": options
-            }
+||| ИСТОРИЯ ДЕЙСТВИЙ |||
+{history_text}
+
+||| ВЫБОР ИГРОКА |||
+{choice_text}
+
+||| НАПОМИНАНИЕ |||
+• Сохраняйте преемственность сюжета
+• Учитывайте предыдущие действия игрока
+• Создавайте атмосферные, но не пугающие описания
+• Давайте логичные варианты действий"""
+
+            try:
+                # Generate response using class-level model with safety settings
+                response = await asyncio.to_thread(
+                    lambda: StoryGenerator.model.generate_content(
+                        prompt,
+                        generation_config=StoryGenerator.generation_config,
+                        safety_settings=StoryGenerator.safety_settings
+                    )
+                )
+                if not response or not response.text:
+                    raise Exception("Empty response received")
+
+                # Check for forbidden content
+                response_text = response.text.lower()
+                for pattern in StoryGenerator.forbidden_patterns:
+                    if re.search(pattern, response_text):
+                        logger.warning(f"Found forbidden content matching pattern: {pattern}")
+                        return {
+                            "text": "⚠️ Контент не соответствует требованиям. Генерирую новый вариант...",
+                            "options": ["🔄 Начать заново"]
+                        }
+
+                # Parse the response
+                story_text, options = StoryParser.parse_response(response.text)
+
+                # Update user context with new story and history
+                new_history = user_data['history'] + [choice] if choice else user_data['history']
+                await db.update_user_context(user_id, story_text, new_history)
+
+                return {
+                    "text": story_text,
+                    "options": options
+                }
+
+            except Exception as e:
+                logger.error(f"Gemini API error: {str(e)}")
+                raise
 
         except Exception as e:
-            logger.error(f"Gemini generation failed: {str(e)}")
+            logger.error(f"Story generation failed: {str(e)}")
             return {
                 "text": "⚠️ Сервис временно недоступен. Попробуйте через несколько минут.",
-                "options": []
+                "options": ["🔄 Начать заново"]
             }
 
 def get_base_keyboard():
+    """Create persistent keyboard with main game controls"""
     keyboard = [
         [KeyboardButton("🎮 Новая игра"), KeyboardButton("❓ Помощь")],
         [KeyboardButton("📊 Статус"), KeyboardButton("🔄 Рестарт")]
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-# Обработчики Telegram
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data['db']
-    user_id = update.effective_user.id
-    user_data = await db.get_user_context(user_id)
-
-    if not user_data["saw_welcome"]:
-        welcome_text = """🧟 *Добро пожаловать в Зомби-Апокалипсис!*
-
-Город охвачен эпидемией. Люди превращаются в зомби, а вы должны выжить.
-Используйте смекалку, избегайте опасности и помогайте другим выжившим.
-
-Команды:
-🎮 Новая игра - Начать историю
-❓ Помощь - Показать помощь
-📊 Статус - Ваш прогресс
-🔄 Рестарт - Начать заново
-
-Удачи! И помните: главное - выжить! 🎯"""
-        # Send welcome message with persistent keyboard
-        welcome_msg = await update.message.reply_text(
-            welcome_text,
-            parse_mode="Markdown",
-            reply_markup=get_base_keyboard()
-        )
-        # Schedule message deletion after 30 seconds
-        context.job_queue.run_once(
-            lambda _: welcome_msg.delete(),
-            30
-        )
-        # Update user's welcome status
-        await db.update_user_context(user_id, "", [], True)
-    else:
-        # Send a brief message for subsequent starts
-        start_msg = await update.message.reply_text(
-            "🎮 Начинаю новую игру...",
-            reply_markup=get_base_keyboard()
-        )
-        # Delete message after 3 seconds
-        context.job_queue.run_once(
-            lambda _: start_msg.delete(),
-            3
-        )
-        await db.update_user_context(user_id, "", [])
-
-    # Generate and send the first story response
-    response = await StoryGenerator.generate_story(db, user_id)
-    await send_response(update, response)
+    # Делаем клавиатуру постоянной и неизменяемой
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        one_time_keyboard=False,
+        input_field_placeholder="Выберите действие..."
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help information"""
     help_text = """🧟 *Руководство по выживанию*
 
 • Внимательно читайте описание ситуации
@@ -386,14 +520,62 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /restart - Начать заново
 
 💡 Совет: Хитрость и осторожность важнее силы!"""
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(
+        help_text,
+        parse_mode="Markdown",
+        reply_markup=get_base_keyboard()
+    )
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start a new game session"""
+    db = context.bot_data['db']
+    user_id = update.effective_user.id
+    user_data = await db.get_user_context(user_id)
+
+    # Create new game session
+    await db.create_new_game(user_id)
+
+    if not user_data["saw_welcome"]:
+        welcome_text = """🧟 *Добро пожаловать в Зомби-Апокалипсис!*
+
+Город охвачен эпидемией. Люди превращаются в зомби, а вы должны выжить.
+Используйте смекалку, избегайте опасности и помогайте другим выжившим.
+
+Команды:
+🎮 Новая игра - Начать новую историю
+❓ Помощь - Показать помощь
+📊 Статус - Ваш прогресс
+🔄 Рестарт - Начать заново
+
+Удачи! И помните: главное - выжить! 🎯"""
+        # Send welcome message with persistent keyboard
+        await update.message.reply_text(
+            welcome_text,
+            parse_mode="Markdown",
+            reply_markup=get_base_keyboard()
+        )
+        # Update user's welcome status
+        await db.update_user_context(user_id, "", [], True)
+    else:
+        # Send a brief message for subsequent starts
+        await update.message.reply_text(
+            "🎮 Начинаю новую игру...",
+            reply_markup=get_base_keyboard()
+        )
+
+    # Generate and send the first story response
+    response = await StoryGenerator.generate_story(db, user_id)
+    await send_response(update, response)
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current game status"""
     db = context.bot_data['db']
     user_id = update.effective_user.id
     user_data = await db.get_user_context(user_id)
 
     if not user_data['history']:
-        await update.message.reply_text("🎯 Вы еще не начали игру. Используйте /start чтобы начать!")
+        await update.message.reply_text(
+            "🎯 Вы еще не начали игру. Используйте /start чтобы начать!",
+            reply_markup=get_base_keyboard()
+        )
         return
 
     history = user_data['history']
@@ -401,101 +583,150 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if history:
         actions_text = "➜ " + "\n➜ ".join(history[-3:])
 
-    status_text = f"""📊 *Ваш прогресс в игре*
+    status_text = f"""📊 *Игровая статистика*
 
-Текущая ситуация:
-{user_data['context'][:200]}...
+*🌆 Текущая ситуация:*
+`{user_data['context'][:200]}...`
 
-Последние действия:
-{actions_text}
+▰▰▰▰▰▰▰▰▰▰
 
-Всего сделано выборов: {len(history)}"""
-    await update.message.reply_text(status_text, parse_mode="Markdown")
+*🎯 Последние действия:*
+`{actions_text}`
 
+▰▰▰▰▰▰▰▰▰▰
+
+*📈 Прогресс:* `{len(history)} действий`"""
+    await update.message.reply_text(
+        status_text,
+        parse_mode="Markdown",
+        reply_markup=get_base_keyboard()
+    )
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Restart the game"""
     db = context.bot_data['db']
     user_id = update.effective_user.id
-    await db.update_user_context(user_id, "", [])
 
-    # Send temporary message
-    restart_msg = await update.message.reply_text("🔄 Игра перезапущена! Начинаем заново...")
-    # Delete message after 3 seconds
-    context.job_queue.run_once(
-        lambda _: restart_msg.delete(),
-        3
+    # Create new game session
+    await db.create_new_game(user_id)
+
+    # Send restart message with persistent keyboard
+    await update.message.reply_text(
+        "🔄 Игра перезапущена! Начинаем заново...",
+        reply_markup=get_base_keyboard()
     )
 
+    # Generate and send the first story response
     response = await StoryGenerator.generate_story(db, user_id)
     await send_response(update, response)
-async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.bot_data['db']
-    query = update.callback_query
-    user_id = query.from_user.id
-
-    # Get the original option text from the button that was clicked
-    choice = query.message.reply_markup.inline_keyboard[int(query.data.split('_')[1]) - 1][0].text
-
-    await query.answer()
-    response = await StoryGenerator.generate_story(db, user_id, choice)
-    await send_response(update, response, message=query.message)
-
 async def send_response(update: Update, response: dict, message=None):
+    """Send or edit message with story response"""
     try:
-        # Format the story text with some styling
-        content = f"{response['text']}\n\n💭 Выберите действие:"
+        # Format the story text with rich styling
+        content = f"""*🌆 Ситуация:*
+`{response['text']}`
 
+▰▰▰▰▰▰▰▰▰▰
+
+*💭 Выберите действие:*"""
         # Create buttons with improved layout
         keyboard = []
         for idx, option in enumerate(response['options']):
             callback_data = f"choice_{idx + 1}"
             keyboard.append([InlineKeyboardButton(option, callback_data=callback_data)])
 
-        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        # Create inline keyboard and always include base keyboard
+        inline_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
-        if message:
+        if message and hasattr(message, 'edit_text'):
             try:
-                await message.edit_text(
+                return await message.edit_text(
                     text=content,
-                    reply_markup=reply_markup,
+                    reply_markup=inline_markup,
                     parse_mode="Markdown"
                 )
             except Exception as edit_error:
                 logger.error(f"Failed to edit message: {edit_error}")
-                # Если не удалось отредактировать, пробуем отправить новое
-                await update.message.reply_text(
-                    text=content,
-                    reply_markup=reply_markup,
-                    parse_mode="Markdown"
-                )
-        else:
-            await update.message.reply_text(
+                if hasattr(update, 'message'):
+                    return await update.message.reply_text(
+                        text=content,
+                        reply_markup=inline_markup,
+                        parse_mode="Markdown"
+                    )
+        elif hasattr(update, 'message'):
+            return await update.message.reply_text(
                 text=content,
-                reply_markup=reply_markup,
+                reply_markup=inline_markup,
                 parse_mode="Markdown"
             )
+        else:
+            logger.error("No valid message object found")
+            return None
+
     except Exception as e:
         logger.error(f"Error in send_response: {e}")
         try:
-            await update.message.reply_text(
-                "⚠️ Произошла ошибка при отправке сообщения. Попробуйте еще раз.",
-                reply_markup=get_base_keyboard()
-            )
+            if hasattr(update, 'message'):
+                return await update.message.reply_text(
+                    "⚠️ Произошла ошибка при отправке сообщения. Попробуйте еще раз.",
+                    reply_markup=get_base_keyboard()
+                )
         except Exception as fallback_error:
             logger.error(f"Failed to send error message: {fallback_error}")
+            return None
+async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button choices"""
+    try:
+        db = context.bot_data['db']
+        query = update.callback_query
+        user_id = query.from_user.id
 
+        # Get the original option text from the button that was clicked
+        choice = query.message.reply_markup.inline_keyboard[int(query.data.split('_')[1]) - 1][0].text
+        # Remove emoji and extra spaces from choice
+        choice = re.sub(r'[⚡🔸🔄]\s*', '', choice).strip()
+
+        await query.answer()
+        response = await StoryGenerator.generate_story(db, user_id, choice)
+        await send_response(update, response, message=query.message)
+    except Exception as e:
+        logger.error(f"Error handling choice: {e}")
+        # В случае ошибки показываем клавиатуру
+        if hasattr(update, 'callback_query'):
+            await update.callback_query.message.reply_text(
+                "⚠️ Произошла ошибка. Попробуйте еще раз:",
+                reply_markup=get_base_keyboard()
+            )
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle keyboard button presses"""
-    text = update.message.text
-    if text == "🎮 Новая игра":
-        await start(update, context)
-    elif text == "❓ Помощь":
-        await help_command(update, context)
-    elif text == "📊 Статус":
-        await status_command(update, context)
-    elif text == "🔄 Рестарт":
-        await restart_command(update, context)
+    try:
+        text = update.message.text
+        # Всегда отправляем клавиатуру с ответом
+        reply_markup = get_base_keyboard()
 
+        if text == "🎮 Новая игра":
+            await start(update, context)
+        elif text == "❓ Помощь":
+            await help_command(update, context)
+        elif text == "📊 Статус":
+            await status_command(update, context)
+        elif text == "🔄 Рестарт":
+            await restart_command(update, context)
+        else:
+            # Если получили неизвестную команду, показываем подсказку
+            await update.message.reply_text(
+                "Выберите действие из меню ниже:",
+                reply_markup=reply_markup
+            )
+    except Exception as e:
+        logger.error(f"Error handling button press: {e}")
+        # В случае ошибки всегда показываем клавиатуру
+        if hasattr(update, 'message'):
+            await update.message.reply_text(
+                "Произошла ошибка. Попробуйте еще раз:",
+                reply_markup=get_base_keyboard()
+            )
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the bot"""
     error = context.error
     logger.error(f"Ошибка: {error}")
 
@@ -503,11 +734,24 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "Message to delete not found" in str(error):
         return
 
-    # Check if update exists and has a message
-    if update and update.message:
-        await update.message.reply_text("⚠️ Произошла непредвиденная ошибка")
-    elif update and update.callback_query:
-        await update.callback_query.answer("⚠️ Произошла ошибка. Попробуйте еще раз.")
+    try:
+        # Check if update exists and has a message
+        if update and update.message:
+            await update.message.reply_text(
+                "⚠️ Произошла непредвиденная ошибка",
+                reply_markup=get_base_keyboard()
+            )
+        elif update and update.callback_query:
+            await update.callback_query.answer(
+                "⚠️ Произошла ошибка. Попробуйте еще раз."
+            )
+            await update.callback_query.message.reply_text(
+                "Выберите действие:",
+                reply_markup=get_base_keyboard()
+            )
+    except Exception as e:
+        logger.error(f"Error in error handler: {e}")
+
 async def post_init(application):
     # Initialize database
     application.bot_data['db'] = await init_database()
@@ -520,7 +764,6 @@ async def post_init(application):
         ("restart", "Начать заново")
     ]
     await application.bot.set_my_commands(commands)
-
 def main():
     try:
         app = (
